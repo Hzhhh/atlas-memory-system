@@ -1,0 +1,29 @@
+# 密钥与环境（绝不提交）
+.env
+.env.*
+*.key
+scripts/gpt_run.sh
+scripts/timeline_run.sh
+scripts/persona_run.sh
+scripts/conflict_run.sh
+scripts/abstain_run.sh
+scripts/unified_run.sh
+logs/
+outputs/
+venv/
+__pycache__/
+*.pyc
+hf_cache/
+# 内部文档与实验材料（不公开）
+STATE_SNAPSHOT.md
+BASELINE_REPORT.md
+EXPERIMENT_P0.md
+ROADMAP.md
+deploy/
+tasks/
+scripts/self_run.sh
+scripts/v2_run.sh
+scripts/route_audit.py
+scripts/unified_report.py
+scripts/list_proc.ps1
+scripts/pip_install.sh
