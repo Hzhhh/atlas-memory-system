@@ -82,14 +82,22 @@ class SearchResponse(BaseModel):
 # ---------- 契约端点 ----------
 @app.post("/add", response_model=AddResponse, dependencies=[Depends(verify_token)])
 def add(req: AddRequest) -> AddResponse:
+    import time as _t
+    _t0 = _t.perf_counter()
     messages = [m.model_dump() for m in req.messages]
     store.add(req.user_id, req.session_id, messages, request_id=req.request_id)
+    print(f"[req] ADD user={req.user_id[:24]} n={len(messages)} "
+          f"{(_t.perf_counter()-_t0)*1000:.0f}ms", flush=True)
     return AddResponse(request_id=req.request_id, user_id=req.user_id, session_id=req.session_id)
 
 
 @app.post("/search", response_model=SearchResponse, dependencies=[Depends(verify_token)])
 def search(req: SearchRequest) -> SearchResponse:
+    import time as _t
+    _t0 = _t.perf_counter()
     items = store.search(req.user_id, req.query, top_k=req.top_k, options=req.options)
+    print(f"[req] SEARCH user={req.user_id[:24]} k={req.top_k} "
+          f"ret={len(items)} {(_t.perf_counter()-_t0)*1000:.0f}ms", flush=True)
     return SearchResponse(data=[MemoryItem(**i) for i in items])
 
 

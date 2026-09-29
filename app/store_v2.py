@@ -62,6 +62,7 @@ class MessageMemoryStore:
                  granularity: str = "message") -> None:
         self._lock = threading.Lock()
         self._bm25_build_lock = threading.Lock()  # 并发 search 去重（只 1 个线程构建，其余等缓存）
+        self._dense_locks: dict[str, threading.Lock] = {}  # per-user dense 编码锁
         self._users: dict[str, dict] = {}
         self.seed_top_n = seed_top_n        # 邻居扩展的种子数（InvMem 用 20）
         self.neighbor_span = neighbor_span  # 每个种子前后各拉几条相邻消息
@@ -96,7 +97,6 @@ class MessageMemoryStore:
                 bucket["persona"].add_session(extract_persona(body))
             if self.granularity == "chunk":
                 self._add_chunk(bucket, session_id, messages)
-                bucket["bm25"] = None
                 self._scan_updates(bucket)
                 return 1
             for m in messages:
@@ -117,7 +117,7 @@ class MessageMemoryStore:
                 entry["_tokens"] = _tokenize(entry["index_text"])
                 bucket["mems"].append(entry)
                 bucket["seq"] += 1
-            bucket["bm25"] = None
+            # BM25 不置脏：水位（bm25_upto）+ delta 打分，不再反复全量重建
             # dense 不置脏：_dense_matrix 按 (matrix, n) 条目数增量补编码
             self._scan_updates(bucket)
             return len(messages)
@@ -162,38 +162,103 @@ class MessageMemoryStore:
         bucket["seq"] += 1
 
     # ---------- Search ----------
-    def _dense_matrix(self, user_id: str, mems: list[dict]) -> np.ndarray | None:
+    def _bm25_scores(self, user_id: str, bm25: BM25Okapi, upto: int,
+                     mems: list[dict], n: int, q: str) -> np.ndarray:
+        """冻结索引打分 + 增量条目（水位后新增）线性补打分，零全量重建。
+
+        官方 Add/Search 交错场景的 P99 灾难根修：原实现每次 Add 置脏、
+        Search 全量重建（大库秒级×并发排队=P99 400s+，实测 2/秒）。
+        delta 打分复用冻结 IDF 的 BM25 公式（排名近似足够 RRF 用）；
+        delta 超阈值才整体重建（周期性，每次 1-2s 可接受）。
+        upto 与 bm25 由调用方锁内同刻拿（配套，防并发错位）；n=一致性水位。"""
+        scores = bm25.get_scores(_tokenize(q))
+        if upto >= n:
+            # 并发下缓存索引可能比本次快照新（别线程快照更大）：截断到本快照
+            # 前 n 条 = mems[:n] 的 BM25 分，数学正确
+            return scores[:n] if scores.shape[0] > n else scores
+        delta = mems[upto:n]
+        if delta:
+            qtoks = _tokenize(q)
+            idf = bm25.idf
+            default_idf = float(np.mean(list(idf.values()))) if idf else 1.0
+            avgdl = max(bm25.avgdl, 1.0)
+            extra = np.zeros(len(delta))
+            for i, m in enumerate(delta):
+                toks = m.get("_tokens") or _tokenize(m["index_text"])
+                s = 0.0
+                for t in qtoks:
+                    f = toks.count(t)
+                    if f:
+                        s += idf.get(t, default_idf) * (f * 2.2) / (
+                            f + 1.2 * (0.25 + 0.75 * len(toks) / avgdl))
+                extra[i] = s
+            scores = np.concatenate([scores, extra])
+            # 周期性整体重建（delta 积累过大时，下次 search 生效）
+            if len(delta) > max(3000, int(0.3 * max(bm25.corpus_size, 1))):
+                with self._bm25_build_lock:
+                    new = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems[:n]])
+                    with self._lock:
+                        if self._users.get(user_id, {}).get("bm25") is bm25:
+                            self._users[user_id]["bm25"] = new
+                            self._users[user_id]["bm25_upto"] = n
+        return scores
+
+    def _dense_matrix(self, user_id: str, mems: list[dict], n: int) -> np.ndarray | None:
         """dense 增量索引：缓存 (matrix, n)，只编码新增条目后 vstack。
 
         官方评测 Add/Search 可能交错——全量重编码在大库（CLB 16 万条）CPU 上
         单次数十分钟会触发超时；bge 逐条编码独立确定，增量=全量数值一致。
-        新增编码失败返回 None（调用方降级 BM25 单路；旧缓存保留，下次重试）。
+        并发去重：同库并发 search 只有一个线程编码增量（per-user 编码锁），
+        其余等锁后直接用新缓存——GIL 竞争与重复编码双消除（P99 400s+ 实测教训）。
+        n=一致性水位（并发 add 安全）。新增编码失败返回 None（调用方降级
+        BM25 单路；旧缓存保留，下次重试）。
         """
         if not self.dense_enabled:
             return None
         with self._lock:
             cached = self._users.get(user_id, {}).get("dense")
-        if cached is not None and cached[1] == len(mems):
+        if cached is not None and cached[1] == n:
             return cached[0]
-        matrix, n = (cached[0], cached[1]) if cached is not None else (None, 0)
-        if len(mems) > n:
-            new = encode_docs([m["content"] for m in mems[n:]])
-            if new is None:
+        with self._dense_lock(user_id):
+            with self._lock:  # 等锁期间别人可能已补编码
+                cached = self._users.get(user_id, {}).get("dense")
+            if cached is not None and cached[1] == n:
+                return cached[0]
+            if cached is not None and cached[1] > n:
+                return cached[0][:n]  # 缓存比水位新：截断到本次快照
+            matrix, done = (cached[0], cached[1]) if cached is not None else (None, 0)
+            if n > done:
+                new = encode_docs([m["content"] for m in mems[done:n]])
+                if new is None:
+                    return None
+                matrix = new if matrix is None else np.vstack([matrix, new])
+            if matrix is None or matrix.shape[0] != n:
                 return None
-            matrix = new if matrix is None else np.vstack([matrix, new])
-        if matrix is None or matrix.shape[0] != len(mems):
-            return None
+            with self._lock:
+                cur = self._users.get(user_id, {}).get("dense") or (None, 0)
+                if self._users.get(user_id) is not None and cur[1] < n:
+                    self._users[user_id]["dense"] = (matrix, n)
+            return matrix
+
+    def _dense_lock(self, user_id: str):
+        """per-user 编码锁（全局字典，惰性创建）。"""
         with self._lock:
-            if self._users.get(user_id) is not None:
-                self._users[user_id]["dense"] = (matrix, len(mems))
-        return matrix
+            lk = self._dense_locks.get(user_id)
+            if lk is None:
+                lk = threading.Lock()
+                self._dense_locks[user_id] = lk
+            return lk
 
     def search(self, user_id: str, query: str, top_k: int = 100,
                options: list[str] | None = None) -> list[dict]:
         with self._lock:
             bucket = self._users.get(user_id)
-            mems = list(bucket["mems"]) if bucket else []
+            # 引用 + 一致性水位：锁内取 n=len(mems)，全程只用前 n 条
+            # （纯引用会在并发 add 下产生长度竞态 IndexError——实测教训）
+            mems = bucket["mems"] if bucket else []
+            n = len(mems)
             bm25 = bucket.get("bm25") if bucket else None
+            bm25_upto = bucket.get("bm25_upto", 0) if bucket else 0  # 与 bm25 配套同刻拿
 
         if not mems:
             return []
@@ -206,27 +271,33 @@ class MessageMemoryStore:
         if bm25 is None:
             with self._bm25_build_lock:
                 with self._lock:  # double-check：等锁期间别人可能已建好
-                    bm25 = self._users.get(user_id, {}).get("bm25")
+                    u0 = self._users.get(user_id)
+                    bm25 = u0.get("bm25") if u0 else None
+                    if bm25 is not None:
+                        bm25_upto = u0.get("bm25_upto", 0)
                 if bm25 is None:
-                    bm25 = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems])
+                    # 首建：冻结全量索引 + 记录水位（后续新增走 delta 打分不重建）
+                    bm25 = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems[:n]])
                     with self._lock:
-                        if self._users.get(user_id) is not None and self._users[user_id].get("bm25") is None:
-                            self._users[user_id]["bm25"] = bm25
-        scores = bm25.get_scores(_tokenize(q))
-
+                        u = self._users.get(user_id)
+                        if u is not None and u.get("bm25") is None:
+                            u["bm25"] = bm25
+                            u["bm25_upto"] = n
+                    bm25_upto = n
+        scores = self._bm25_scores(user_id, bm25, bm25_upto, mems, n, q)
         # 加权 RRF 融合（InvMem 冻结参数）：fused = 1.0/(k+rd) + 0.5/(k+rb)
-        matrix = self._dense_matrix(user_id, mems)
+        matrix = self._dense_matrix(user_id, mems, n)
         qvec = encode_query(q) if matrix is not None else None
         if matrix is not None and qvec is not None:
             sims = matrix @ qvec                       # 余弦（已归一化）
             lex_mask = scores > 0                      # InvMem：仅 BM25>0 的进词法排名
             dense_order = np.argsort(-sims)            # dense 全量排名
             lex_order = np.argsort(-scores[lex_mask]) if lex_mask.any() else np.array([], dtype=int)
-            lex_local = np.empty(len(mems), dtype=np.int64)
+            lex_local = np.empty(n, dtype=np.int64)    # 尺寸锚定一致性水位 n
             lex_global = np.flatnonzero(lex_mask)
             lex_local[lex_global[lex_order]] = np.arange(len(lex_global))
-            dense_rank = np.empty(len(mems), dtype=np.int64)
-            dense_rank[dense_order] = np.arange(len(mems))
+            dense_rank = np.empty(n, dtype=np.int64)
+            dense_rank[dense_order] = np.arange(n)
             fused = DENSE_WEIGHT / (RRF_K + dense_rank + 1)
             fused[lex_mask] += LEXICAL_WEIGHT / (RRF_K + lex_local[lex_mask] + 1)
             order = np.lexsort((-sims, -fused))        # 主键 fused，并列按 dense
@@ -235,7 +306,7 @@ class MessageMemoryStore:
             ranked = sorted(zip(mems, scores), key=lambda x: x[1], reverse=True)
 
         # A1+A4: 种子 + 同 session 相邻消息（证据常在"命中句的下一句回复"）
-        by_seq = {m["seq"]: m for m in mems}
+        by_seq = {m["seq"]: m for m in mems[:n]}  # 一致性水位
         picked: list[tuple[dict, float]] = []
         seen: set[int] = set()
 
@@ -273,7 +344,7 @@ class MessageMemoryStore:
                     if want:
                         by_rank = {id(m): i for i, (m, _) in enumerate(ranked)}
                         extra = sorted(
-                            (m for m in mems if m["seq"] in want),
+                            (m for m in mems[:n] if m["seq"] in want),
                             key=lambda m: by_rank.get(id(m), 10 ** 9),
                         )
                         for m in extra:
