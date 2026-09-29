@@ -144,6 +144,7 @@ class UpdateConflictIndex:
         self.assertives: list[dict] = []  # 肯定侧池（矛盾对正侧，marker 放宽）
         self.conflict_pairs: list[dict] = []  # 成型矛盾对
         self.scanned: int = -1            # 已扫描到的 seq 水位（增量防重扫）
+        self._pairs_dirty: bool = True    # 矛盾对惰性构建标记（Add 只积累，Search 才构建）
 
     @staticmethod
     def _overlap(a: list[str], b: list[str]) -> float:
@@ -163,19 +164,29 @@ class UpdateConflictIndex:
                 chain["events"].append((ev["seq"], ev["ts"], ev["value"], ev["sentence"], ev["role"]))
 
     def add_neg_sides(self, events: list[dict]) -> None:
-        for ev in events:
-            self.neg_sides.append(ev)
+        self.neg_sides.extend(events)
+        self._pairs_dirty = True
 
     def add_assertives(self, events: list[dict]) -> None:
-        for ev in events:
-            self.assertives.append(ev)
+        self.assertives.extend(events)
+        self._pairs_dirty = True
 
-    def build_conflicts(self) -> None:
-        """否定侧 vs (更新链最新 ∪ 肯定侧池) 主题重叠 → 矛盾对。
-        全量重建（幂等，避免增量重复）。优先更新链（有 marker 更可信），
-        链未命中再查肯定侧池（BEAM 实证：marker 门槛漏 80% 矛盾对）。"""
+    def ensure_pairs(self) -> None:
+        """矛盾对惰性构建（Search 时调用，dirty 才重建）。
+
+        Add 路径零成本（官方 Full 实测教训：O(negs×asserts) 全量配对在每次
+        Add 重跑，add 耗时超线性增长 37ms→600ms+，3050 条 11 分钟没灌完，
+        官方判 ADD_RUNTIME_ERROR）。配对用词倒排加速：每个 neg 只与共享词
+        的 asserts 求交，近似线性。"""
+        if not self._pairs_dirty:
+            return
+        # 肯定侧词倒排
+        from collections import defaultdict as _dd
+        inv: dict[str, list[int]] = _dd(list)
+        for idx, a in enumerate(self.assertives):
+            for w in set(a["topic"]):
+                inv[w].append(idx)
         self.conflict_pairs = []
-        used_pos: set[int] = set()
         for ev in self.neg_sides:
             chain = max((c for c in self.chains if self._overlap(c["topic"], ev["topic"]) >= 0.5),
                         key=lambda c: self._overlap(c["topic"], ev["topic"]), default=None)
@@ -187,22 +198,27 @@ class UpdateConflictIndex:
                     "side_pos": latest[3], "side_pos_ts": latest[1],
                 })
                 continue
+            cand: dict[int, int] = _dd(int)
+            ev_words = set(ev["topic"])
+            for w in ev_words:
+                for idx in inv.get(w, ()):
+                    cand[idx] += 1
             best, best_ov, best_shared = None, 0.0, 0
-            for a in self.assertives:
+            for idx, shared in cand.items():
+                a = self.assertives[idx]
                 if a["seq"] == ev["seq"]:
                     continue
-                ov = self._overlap(a["topic"], ev["topic"])
-                shared = len(set(a["topic"]) & set(ev["topic"]))
+                ov = shared / min(len(a["topic"]), len(ev["topic"]))
                 if ov > best_ov:
                     best_ov, best, best_shared = ov, a, shared
-            # 短主题句复合标准：共享 ≥2 词且 overlap ≥0.3（纯 0.5 比例阈值
-            # 对 5 词主题漏配——smoke 实证 2/5=0.4 被拒）
+            # 短主题句复合标准：共享 ≥2 词且 overlap ≥0.3
             if best is not None and best_shared >= 2 and best_ov >= 0.3:
                 self.conflict_pairs.append({
                     "topic": ev["topic"],
                     "side_neg": ev["sentence"], "side_neg_ts": ev["ts"],
                     "side_pos": best["sentence"], "side_pos_ts": best["ts"],
                 })
+        self._pairs_dirty = False
 
     def latest_for(self, query_words: set[str], query: str = "") -> dict | None:
         """注入 v2 三重触发（2026-09-24）：数值期望词 + 重叠≥3 + 值类型匹配。
@@ -226,6 +242,7 @@ class UpdateConflictIndex:
         """渲染门控（9-28 收紧）：重叠 ≥4。矛盾对池放宽（肯定侧无 marker）
         后误触发爆炸（BEAM 56% 题带卡）——池可以宽，渲染必须严：
         假阴性退基线零代价，假阳性注入矛盾卡直接带偏 answer。"""
+        self.ensure_pairs()
         best, best_ov = None, 0
         for p in self.conflict_pairs:
             ov = len(query_words & set(p["topic"]))

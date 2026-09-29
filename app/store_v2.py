@@ -61,6 +61,7 @@ class MessageMemoryStore:
     def __init__(self, seed_top_n: int = 20, neighbor_span: int = 1,
                  granularity: str = "message") -> None:
         self._lock = threading.Lock()
+        self._bm25_build_lock = threading.Lock()  # 并发 search 去重（只 1 个线程构建，其余等缓存）
         self._users: dict[str, dict] = {}
         self.seed_top_n = seed_top_n        # 邻居扩展的种子数（InvMem 用 20）
         self.neighbor_span = neighbor_span  # 每个种子前后各拉几条相邻消息
@@ -77,12 +78,19 @@ class MessageMemoryStore:
         self.abstain_min_keep = int(os.environ.get("AML_ABSTAIN_MIN_KEEP", "10"))
 
     # ---------- Add ----------
-    def add(self, user_id: str, session_id: str, messages: list[dict]) -> int:
+    def add(self, user_id: str, session_id: str, messages: list[dict],
+            request_id: str = "") -> int:
         with self._lock:
             bucket = self._users.setdefault(
                 user_id, {"mems": [], "bm25": None, "dense": None, "seq": 0,
-                          "uc": UpdateConflictIndex(), "ei": EntityIndex(), "persona": PersonaCard()}
+                          "uc": UpdateConflictIndex(), "ei": EntityIndex(), "persona": PersonaCard(),
+                          "_req_ids": set()}
             )
+            # request_id 幂等（官方 Full 断点续跑硬性要求：重放 Add 不得重复写入）
+            if request_id and request_id in bucket["_req_ids"]:
+                return 0
+            if request_id:
+                bucket["_req_ids"].add(request_id)
             if self.persona_enabled:
                 body = "\n".join(str(m.get("content", "")) for m in messages)
                 bucket["persona"].add_session(extract_persona(body))
@@ -105,6 +113,8 @@ class MessageMemoryStore:
                 entry["index_text"] = (
                     f"Speaker: {role}\nEvent date: {fmt_date(ts)}\n{entry['content']}"
                 )
+                # tokenize 缓存：Add 算一次，BM25 重建复用（重建从 tokenize 主导变统计主导）
+                entry["_tokens"] = _tokenize(entry["index_text"])
                 bucket["mems"].append(entry)
                 bucket["seq"] += 1
             bucket["bm25"] = None
@@ -130,7 +140,8 @@ class MessageMemoryStore:
         uc.add_updates(updates)
         uc.add_neg_sides(negs)
         uc.add_assertives(asserts)
-        uc.build_conflicts()
+        # 矛盾对构建改惰性（Search 时 ensure_pairs）——Add 路径零成本
+        # （Full ADD_RUNTIME_ERROR 教训：每次 Add 全量配对超线性变慢）
 
     def _add_chunk(self, bucket: dict, session_id: str, messages: list[dict]) -> None:
         """整 chunk 一个记忆单元：Event date 进索引键，返回时带日期前缀。"""
@@ -193,10 +204,14 @@ class MessageMemoryStore:
             q = query + "\nOptions:\n" + "\n".join(options)
 
         if bm25 is None:
-            bm25 = BM25Okapi([_tokenize(m["index_text"]) for m in mems])
-            with self._lock:
-                if self._users.get(user_id, {}).get("bm25") is None:
-                    self._users[user_id]["bm25"] = bm25
+            with self._bm25_build_lock:
+                with self._lock:  # double-check：等锁期间别人可能已建好
+                    bm25 = self._users.get(user_id, {}).get("bm25")
+                if bm25 is None:
+                    bm25 = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems])
+                    with self._lock:
+                        if self._users.get(user_id) is not None and self._users[user_id].get("bm25") is None:
+                            self._users[user_id]["bm25"] = bm25
         scores = bm25.get_scores(_tokenize(q))
 
         # 加权 RRF 融合（InvMem 冻结参数）：fused = 1.0/(k+rd) + 0.5/(k+rb)
