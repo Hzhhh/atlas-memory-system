@@ -169,6 +169,12 @@ class UpdateConflictIndex:
 
     def add_assertives(self, events: list[dict]) -> None:
         self.assertives.extend(events)
+        # 内存上限（官方 Full 教训：CLB 长文档带值句多，池无上限时 4.7 万+/user
+        # 撑爆 16G）。配对只关心主题相近句，保留最近 2000 条即覆盖冲突题窗口
+        #（矛盾对两侧通常在相邻 session）；裁剪只影响极老句子的漏配，渲染门控
+        # ≥4 重叠下行为差异可忽略（build diff 验证）。
+        if len(self.assertives) > 2000:
+            del self.assertives[: len(self.assertives) - 2000]
         self._pairs_dirty = True
 
     def ensure_pairs(self) -> None:

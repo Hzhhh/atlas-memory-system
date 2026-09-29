@@ -40,6 +40,18 @@ def _tokenize(text: str) -> list[str]:
     return _TOKEN.findall(text.lower())
 
 
+def _entry_tokens(entry: dict) -> list[str]:
+    """条目 token 的紧凑存储读取：str(空格join) 或 list 兼容。
+
+    官方 Full 内存教训：_tokens 存 list[str] 每条目 ~18KB（str 对象+指针
+    开销 × 14 万条 = 2.6G）。token 词元 [a-z0-9]+ 空格 join 无损，str 存储
+    省 ~90%，消费时 split 还原（重建 BM25 一次性成本）。"""
+    toks = entry.get("_tokens")
+    if toks is None:
+        return _tokenize(entry["index_text"])
+    return toks.split() if isinstance(toks, str) else toks
+
+
 def fmt_date(ts_ms: int | None) -> str:
     """毫秒时间戳 -> '17 August 2023'（英文长日期，gpt-4o-mini 日期算术更稳）"""
     if not ts_ms:
@@ -109,12 +121,13 @@ class MessageMemoryStore:
                     "ts": ts,
                     "content": m.get("content", ""),
                 }
-                # 索引键：说话人 + 事件日期 + 原文（只进 BM25 语料，不进返回值）
-                entry["index_text"] = (
+                # 索引键：说话人 + 事件日期 + 原文——Add 时算完 token 即弃，
+                # 不再存 index_text 副本（content 已在 entry，重复存 = +8% 内存）
+                index_text = (
                     f"Speaker: {role}\nEvent date: {fmt_date(ts)}\n{entry['content']}"
                 )
-                # tokenize 缓存：Add 算一次，BM25 重建复用（重建从 tokenize 主导变统计主导）
-                entry["_tokens"] = _tokenize(entry["index_text"])
+                # tokenize 缓存（紧凑 str 存储）：Add 算一次，BM25 重建复用
+                entry["_tokens"] = " ".join(_tokenize(index_text))
                 bucket["mems"].append(entry)
                 bucket["seq"] += 1
             # BM25 不置脏：水位（bm25_upto）+ delta 打分，不再反复全量重建
@@ -184,7 +197,7 @@ class MessageMemoryStore:
             avgdl = max(bm25.avgdl, 1.0)
             extra = np.zeros(len(delta))
             for i, m in enumerate(delta):
-                toks = m.get("_tokens") or _tokenize(m["index_text"])
+                toks = _entry_tokens(m)
                 s = 0.0
                 for t in qtoks:
                     f = toks.count(t)
@@ -196,7 +209,7 @@ class MessageMemoryStore:
             # 周期性整体重建（delta 积累过大时，下次 search 生效）
             if len(delta) > max(3000, int(0.3 * max(bm25.corpus_size, 1))):
                 with self._bm25_build_lock:
-                    new = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems[:n]])
+                    new = BM25Okapi([_entry_tokens(m) for m in mems[:n]])
                     with self._lock:
                         if self._users.get(user_id, {}).get("bm25") is bm25:
                             self._users[user_id]["bm25"] = new
@@ -277,7 +290,7 @@ class MessageMemoryStore:
                         bm25_upto = u0.get("bm25_upto", 0)
                 if bm25 is None:
                     # 首建：冻结全量索引 + 记录水位（后续新增走 delta 打分不重建）
-                    bm25 = BM25Okapi([m.get("_tokens") or _tokenize(m["index_text"]) for m in mems[:n]])
+                    bm25 = BM25Okapi([_entry_tokens(m) for m in mems[:n]])
                     with self._lock:
                         u = self._users.get(user_id)
                         if u is not None and u.get("bm25") is None:
