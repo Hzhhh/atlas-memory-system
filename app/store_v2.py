@@ -359,7 +359,8 @@ class MessageMemoryStore:
                 picked = strong[:top_k] if len(strong) >= self.abstain_min_keep \
                     else picked[: self.abstain_min_keep]
 
-        return self._render(user_id, picked[:top_k], q)
+        # 契约硬约束：data 不超 top_k（注入卡插头部后总数可能超限，截尾部低分）
+        return self._render(user_id, picked[:top_k], q)[:top_k]
 
     def _render(self, user_id: str, picked: list[tuple[dict, float]], q: str) -> list[dict]:
         """返回侧组装：时间戳前缀 + 更新对/矛盾对条目注入（原文句+标注，非 LLM 改写）。"""
